@@ -263,6 +263,17 @@ streamer.client.on('messageCreate', async (message) => {
                     }
                 }
                 break;
+            case 'ytrandom':
+                {
+                    try {
+                        await playRandom(message);
+                    } catch (error) {
+                        logger.error('Failed to play random video:', error);
+                        await cleanupStreamStatus();
+                        await sendError(message, 'Failed to play random video. Please try again.');
+                    }
+                }
+                break;
             case 'ytsearch':
                 {
                     const query = args.length > 1 ? args.slice(1).join(' ') : args[1] || args.shift() || '';
@@ -400,6 +411,7 @@ streamer.client.on('messageCreate', async (message) => {
                         `\`${config.prefix}play\` - Play local video`,
                         `\`${config.prefix}playlink\` - Play video from URL/YouTube/Twitch`,
                         `\`${config.prefix}ytplay\` - Play video from YouTube`,
+                        `\`${config.prefix}ytrandom\` - Endless random Russian YouTube`,
                         `\`${config.prefix}stop\` - Stop playback`,
                         '',
                         '🛠️ **Utils**',
@@ -429,7 +441,7 @@ streamer.client.on('messageCreate', async (message) => {
 });
 
 // Function to play video
-async function playVideo(message: Message, videoSource: string, title?: string) {
+async function playVideo(message: Message, videoSource: string, title?: string, leaveVoice: boolean = true, sendFinish: boolean = true) {
     logger.info(`Attempting to play: ${title || videoSource}`);
     const [guildId, channelId, cmdChannelId] = [config.guildId, config.videoChannelId, config.cmdChannelId!];
 
@@ -531,11 +543,11 @@ async function playVideo(message: Message, videoSource: string, title?: string) 
         logger.error(`Error in playVideo for ${title || videoSource}:`, error);
         if (!controller.signal.aborted) controller?.abort();
     } finally {
-        if (!streamStatus.manualStop && !controller.signal.aborted) {
+        if (sendFinish && !streamStatus.manualStop && !controller.signal.aborted) {
             await sendFinishMessage();
         }
 
-        await cleanupStreamStatus();
+        await cleanupStreamStatus(leaveVoice);
 
         if (tempFilePath && !isLiveYouTubeStream) {
             try {
@@ -550,7 +562,7 @@ async function playVideo(message: Message, videoSource: string, title?: string) 
 }
 
 // Function to cleanup stream status
-async function cleanupStreamStatus() {
+async function cleanupStreamStatus(leaveVoice: boolean = true) {
     if (streamStatus.manualStop) {
         return;
     }
@@ -558,20 +570,24 @@ async function cleanupStreamStatus() {
     try {
         controller?.abort();
         streamer.stopStream();
-        streamer.leaveVoice();
+        if (leaveVoice) {
+            streamer.leaveVoice();
+        }
 
         streamer.client.user?.setActivity(status_idle() as ActivityOptions);
 
-        // Reset all status flags
-        streamStatus.joined = false;
-        streamStatus.joinsucc = false;
+        if (leaveVoice) {
+            // Reset all status flags
+            streamStatus.joined = false;
+            streamStatus.joinsucc = false;
+            streamStatus.channelInfo = {
+                guildId: "",
+                channelId: "",
+                cmdChannelId: "",
+            };
+        }
         streamStatus.playing = false;
         streamStatus.manualStop = false;
-        streamStatus.channelInfo = {
-            guildId: "",
-            channelId: "",
-            cmdChannelId: "",
-        };
     } catch (error) {
         logger.error("Error during cleanup:", error);
     }
@@ -609,6 +625,56 @@ async function getTwitchStreamUrl(url: string): Promise<string | null> {
 // Function to search for videos on YouTube
 async function ytSearch(title: string): Promise<string[]> {
     return await youtube.search(title);
+}
+
+const randomQueries = [
+    'музыка',
+    'игра',
+    'новости',
+    'фильм',
+    'юмор',
+    'анимация',
+    'технологии',
+    'история',
+    'путешествия',
+    'образование'
+];
+
+function getRandomQuery(): string {
+    return randomQueries[Math.floor(Math.random() * randomQueries.length)];
+}
+
+async function getRandomRussianVideo(): Promise<{ url: string; title: string }> {
+    const query = getRandomQuery();
+    const results = await yts.search(query, { limit: 5 });
+    if (results.length === 0) {
+        throw new Error('No videos found');
+    }
+    const chosen = results[Math.floor(Math.random() * results.length)];
+    return { url: chosen.url, title: chosen.title || 'YouTube video' };
+}
+
+async function playRandom(message: Message) {
+    const pausePath = path.join(config.videosDir, 'pause.mp4');
+    let nextVideo = await getRandomRussianVideo();
+
+    while (!streamStatus.manualStop) {
+        const fetchNext = getRandomRussianVideo();
+        await playVideo(message, nextVideo.url, nextVideo.title, false);
+        if (streamStatus.manualStop) break;
+
+        const pausePromise = fs.existsSync(pausePath)
+            ? playVideo(message, pausePath, 'Pause', false, false)
+            : Promise.resolve();
+
+        nextVideo = await fetchNext;
+        if (fs.existsSync(pausePath)) {
+            controller.abort();
+            await pausePromise.catch(() => { });
+        }
+    }
+
+    await cleanupStreamStatus();
 }
 
 const status_idle = () => {
